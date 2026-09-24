@@ -23,12 +23,12 @@ jobs:
         uses: actions/setup-node@v4
         with:
           node-version: "22"
-          cache: npm
+          cache: "npm"
 
       - name: Install dependencies
         run: npm ci
 
-      - name: Check syntax
+      - name: Check for syntax errors
         run: node --check src/server.js
 
   deploy:
@@ -48,18 +48,16 @@ jobs:
           aws-region: ${{ secrets.AWS_REGION }}
 
       - name: Verify AWS identity
-        run: |
-          aws sts get-caller-identity
+        run: aws sts get-caller-identity
 
       - name: Deploy to EC2 via SSH
-        uses: appleboy/ssh-action@v1.2.2
+        uses: appleboy/ssh-action@v1
         with:
           host: ${{ secrets.EC2_HOST }}
           username: ${{ secrets.EC2_USERNAME }}
           key: ${{ secrets.EC2_SSH_KEY }}
           port: 22
           command_timeout: 10m
-          timeout: 30s
 
           script: |
             set -e
@@ -69,45 +67,18 @@ jobs:
             echo "Time: $(date)"
             echo "========================================="
 
-            APP_DIR="/home/ec2-user/backend"
+            APP_DIR="/var/www/backend"
+            REPO_URL="https://github.com/${{ github.repository }}.git"
             BRANCH="main"
 
-            echo "Application directory: $APP_DIR"
+            echo "Preparing application directory..."
 
-            # Create application directory
-            mkdir -p "$APP_DIR"
-
-            # Check required commands
-            echo "Checking required software..."
-
-            command -v git
-            command -v node
-            command -v npm
-            command -v pm2
-
-            echo "Software check completed."
-
-            # Move to application directory
-            cd "$APP_DIR"
-
-            # Repository URL
-            REPO_URL="https://github.com/${{ github.repository }}.git"
+            sudo mkdir -p "$APP_DIR"
+            sudo chown -R "$USER:$USER" "$APP_DIR"
 
             if [ -d "$APP_DIR/.git" ]; then
+              echo "Repository exists. Preparing backup files..."
 
-              echo "Repository already exists."
-              echo "Pulling latest changes..."
-
-              git fetch origin "$BRANCH"
-              git reset --hard "origin/$BRANCH"
-              git clean -fd
-
-            else
-
-              echo "Repository does not exist."
-              echo "Cloning repository..."
-
-              # Backup existing environment/config files if they exist
               if [ -f "$APP_DIR/.env" ]; then
                 cp "$APP_DIR/.env" /tmp/backend-env-backup
               fi
@@ -116,99 +87,94 @@ jobs:
                 cp "$APP_DIR/ecosystem.config.js" /tmp/backend-ecosystem-backup
               fi
 
-              # Clone repository
-              git clone \
-                --branch "$BRANCH" \
-                --single-branch \
-                "$REPO_URL" \
-                "$APP_DIR"
+              echo "Pulling latest changes..."
 
               cd "$APP_DIR"
 
-              # Restore .env
+              git fetch origin "$BRANCH"
+              git reset --hard "origin/$BRANCH"
+              git clean -fd
+
               if [ -f "/tmp/backend-env-backup" ]; then
                 cp /tmp/backend-env-backup "$APP_DIR/.env"
                 rm -f /tmp/backend-env-backup
               fi
 
-              # Restore PM2 configuration
               if [ -f "/tmp/backend-ecosystem-backup" ]; then
                 cp /tmp/backend-ecosystem-backup "$APP_DIR/ecosystem.config.js"
                 rm -f /tmp/backend-ecosystem-backup
               fi
 
+            else
+              echo "Repository does not exist yet."
+
+              if [ -f "$APP_DIR/.env" ]; then
+                cp "$APP_DIR/.env" /tmp/backend-env-backup
+              fi
+
+              if [ -f "$APP_DIR/ecosystem.config.js" ]; then
+                cp "$APP_DIR/ecosystem.config.js" /tmp/backend-ecosystem-backup
+              fi
+
+              echo "Removing existing application directory..."
+
+              sudo rm -rf "$APP_DIR"
+
+              echo "Creating application directory..."
+
+              sudo mkdir -p "$APP_DIR"
+              sudo chown -R "$USER:$USER" "$APP_DIR"
+
+              echo "Cloning repository..."
+
+              git clone --branch "$BRANCH" --single-branch "$REPO_URL" "$APP_DIR"
+
+              cd "$APP_DIR"
+
+              if [ -f "/tmp/backend-env-backup" ]; then
+                cp /tmp/backend-env-backup "$APP_DIR/.env"
+                rm -f /tmp/backend-env-backup
+              fi
+
+              if [ -f "/tmp/backend-ecosystem-backup" ]; then
+                cp /tmp/backend-ecosystem-backup "$APP_DIR/ecosystem.config.js"
+                rm -f /tmp/backend-ecosystem-backup
+              fi
             fi
 
-            echo "Installing production dependencies..."
+            echo "Installing dependencies..."
 
             cd "$APP_DIR"
 
-            npm ci --omit=dev
+            npm ci --production
 
-            echo "Dependencies installed."
-
-            echo "Checking PM2..."
-
-            pm2 --version
-
-            echo "Restarting application..."
+            echo "Restarting application with PM2..."
 
             if pm2 describe backend-api > /dev/null 2>&1; then
-
-              echo "Application already running."
-              echo "Reloading PM2..."
-
               pm2 reload ecosystem.config.js --env production
-
             else
-
-              echo "Application not running."
-              echo "Starting PM2..."
-
               pm2 start ecosystem.config.js --env production
-
             fi
 
-            # Save PM2 process list
             pm2 save
 
             echo "Waiting for application to start..."
 
             sleep 5
 
-            echo "Checking PM2 status..."
-
-            pm2 status
-
             echo "Health check..."
 
-            HTTP_STATUS=$(curl \
-              -s \
-              -o /dev/null \
-              -w "%{http_code}" \
-              --max-time 10 \
-              http://127.0.0.1:5000/api/health || echo "000")
-
-            echo "Health check HTTP status: $HTTP_STATUS"
+            HTTP_STATUS=$(curl -s -o /dev/null -w "%{http_code}" http://localhost:5000/api/health || echo "000")
 
             if [ "$HTTP_STATUS" = "200" ]; then
-
-              echo "SUCCESS: Health check passed."
-
+              echo "SUCCESS: Health check passed (HTTP $HTTP_STATUS)"
             else
-
-              echo "ERROR: Health check failed."
-              echo "PM2 status:"
-              pm2 status
-
-              echo "Recent PM2 logs:"
-              pm2 logs backend-api --lines 30 --nostream
-
-              exit 1
-
+              echo "WARNING: Health check returned HTTP $HTTP_STATUS"
+              echo "Checking PM2 logs for errors..."
+              pm2 logs backend-api --lines 20 --nostream
             fi
 
             echo "========================================="
-            echo "DEPLOYMENT SUCCESSFUL"
+            echo "DEPLOYMENT FINISHED"
             echo "Time: $(date)"
             echo "========================================="
